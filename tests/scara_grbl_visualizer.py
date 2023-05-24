@@ -6,13 +6,14 @@ import serial
 import numpy as np
 import matplotlib.pyplot as plt
 
+
 # confire correct relative paths to file
 import sys, os
 # sys.path.append(os.path.dirname(__file__))
 
 GRBL_PORT = '/dev/ttyACM0'
 GRBL_BUFFER_SIZE = 127
-STATE_POLL_INTERVAL = 0.1
+STATE_POLL_INTERVAL = 0.03
 
 
 class GrblInterface:
@@ -128,37 +129,39 @@ class ScaraPlot:
         plt.ion()
         plt.show(block=False)
 
+        # plot work-area circles
+        self.ax.add_artist(plt.Circle((0, 0), l1+l2, color='r', fill=False))
+        self.ax.add_artist(plt.Circle((0, 0), l1-l2, color='r', fill=False))
+
         self.line, = self.ax.plot([], [], 'o-', lw=2)
         self.p1, = self.ax.plot([], [], 'ro', markersize=10)
         self.p2, = self.ax.plot([], [], 'bo', markersize=10)
 
-        self.plot(np.array([0, 0]))
+        self.p_pos, = self.ax.plot([], [], 'g+', markersize=7) 
+        self.trajectory = [[], []]
+        self.traject_plot, = self.ax.plot([], [], 'g-', lw=1)
 
-    def plot(self, q):
+        self.plot_update(np.array([0, 0]))
+
+    def plot_update(self, q, xy=None):
         x1 = self.l1*np.cos(q[0])
         y1 = self.l1*np.sin(q[0])
         x2 = x1 + self.l2*np.cos(q[1])
         y2 = y1 + self.l2*np.sin(q[1])
 
-        # print(f"q=({q[0]:.0f},{q[1]:.0f}) p1=({x1:.2f},{y1:.2f}) p2=({x2:.2f},{y2:.2f})")
-
         self.line.set_data([0, x1, x2], [0, y1, y2])
         self.p1.set_data(x1, y1)
         self.p2.set_data(x2, y2)
-        
+
+        if xy is not None:
+            self.trajectory[0].append(xy[0])
+            self.trajectory[1].append(xy[1])
+            self.traject_plot.set_data(self.trajectory[0], self.trajectory[1])
+            self.p_pos.set_data(xy[0], xy[1])
+                    
         self.fig.canvas.draw()
         self.fig.canvas.flush_events()
 
-
-update_plot = True
-def plot_update(grbl, plot):
-    while update_plot:
-        report = grbl.get_report()
-
-        q = report['Qj'].split(',')
-        q = np.array([float(q[0]), float(q[1])])
-        plot.plot(q)
-        time.sleep(0.05)
 
 def send_gcode(grbl, selected_file):
     with open(selected_file, 'r') as file:
@@ -166,46 +169,33 @@ def send_gcode(grbl, selected_file):
         for line in file:
             line = line.strip()
             grbl.serial_send(line)
-            time.sleep(2)
+            #time.sleep(2)
 
 # animate a simple trajectory
 if __name__ == "__main__":
-    l1 = 700
-    l2 = 600
+    l1 = 500
+    l2 = 450
     plot = ScaraPlot(l1, l2)
 
-    # t = np.linspace(0, 3, 100)
-    # q = np.zeros((2, t.size))
-    # q[0,:] = 2*t
-    # q[1,:] = 1.5*t
-
-    # input("Press enter to animate")
-    # for qi in q.T:
-    #     sp.plot(qi)
-    #     time.sleep(0.1)
-
-
     grbl = GrblInterface()
-    time.sleep(2)
-
-    # t_plot = Thread(target=plot_update, args=(grbl, plot))
-    # t_plot.start()
+    time.sleep(1)
 
     # stream gcode file
     selected_file = os.path.join(os.path.dirname(__file__), 'test.gcode')
-    # selected_file = 'dog tag (g-code).gc'
     t_gcode = Thread(target=send_gcode, args=(grbl, selected_file))
     t_gcode.start()
+    print(t_gcode.is_alive())
 
-    plot_update(grbl, plot)
+    # wait till all commands are processed
+    while t_gcode.is_alive() or len(grbl.chars_in_buffer.queue) > 0:
+        report = grbl.get_report()
+        q = report['Qj'].split(',')
+        q = np.array([float(q[0]), float(q[1])])
+        xy = report['MPos'].split(',')
+        xy = np.array([float(xy[0]), float(xy[1])])
 
-    t_gcode.join()
-    
-    while len(grbl.chars_in_buffer.queue) > 0:
-        time.sleep(0.1)
+        plot.plot_update(q, xy)
+        time.sleep(STATE_POLL_INTERVAL)
 
     grbl.close()
     print("done")
-
-
-# test command: $X G1 X200 Y200 F1000
