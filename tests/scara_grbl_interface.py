@@ -6,6 +6,10 @@ import serial
 import numpy as np
 import matplotlib.pyplot as plt
 
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import PySimpleGUI as sg
+import matplotlib
+matplotlib.use('TkAgg')
 
 # confire correct relative paths to file
 import sys, os
@@ -13,11 +17,13 @@ import sys, os
 
 GRBL_PORT = '/dev/ttyACM0'
 GRBL_BUFFER_SIZE = 127
-STATE_POLL_INTERVAL = 0.03
+STATE_POLL_INTERVAL = 0.3
 
 
 class GrblInterface:
     def __init__(self):
+        self.new_report = False
+
         print(f"connecting to grbl at {GRBL_PORT}")
         self.ser = serial.serial_for_url(
             url=GRBL_PORT,
@@ -25,6 +31,8 @@ class GrblInterface:
             timeout=20,
             write_timeout=0,
         )
+
+        self.log = []
 
         self._quit = False
         self.report = ''
@@ -54,6 +62,7 @@ class GrblInterface:
         while not self._quit:
             line = self.lines_to_send.get()
             print(">> " + line)
+            self.log.append('>>  '+line)
 
             # wait until there is space in the buffer
             buf_size = 127
@@ -77,12 +86,14 @@ class GrblInterface:
             if 'ok' in out_temp: 
                 # grbl handled a line
                 print("<ok< "+out_temp)
-                self.chars_in_buffer.get()                
+                self.chars_in_buffer.get()
             elif out_temp[0] == '<' and out_temp[-1] == '>':
                 self.report = out_temp
                 print("<??< " + out_temp)
+                self.new_report = True
             else:
                 print("<<<< " + out_temp)
+                self.log.append('<<< '+out_temp)
         
         print("exiting receiver thread")
 
@@ -127,7 +138,6 @@ class ScaraPlot:
         self.ax.set_ylabel('Y (m)')
         self.ax.set_title('SCARA Robot')
         plt.ion()
-        plt.show(block=False)
 
         # plot work-area circles
         self.ax.add_artist(plt.Circle((0, 0), l1+l2, color='r', fill=False))
@@ -142,6 +152,15 @@ class ScaraPlot:
         self.traject_plot, = self.ax.plot([], [], 'g-', lw=1)
 
         self.plot_update(np.array([0, 0]))
+
+    def plot_report(self, report):
+        q = report['Qj'].split(',')
+        q = np.array([float(q[0]), float(q[1])])
+        q = q / 180 * np.pi
+        xy = report['MPos'].split(',')
+        xy = np.array([float(xy[0]), float(xy[1])])
+
+        self.plot_update(q, xy)
 
     def plot_update(self, q, xy=None):
         x1 = self.l1*np.cos(q[0])
@@ -171,31 +190,76 @@ def send_gcode(grbl, selected_file):
             grbl.serial_send(line)
             #time.sleep(2)
 
-# animate a simple trajectory
+
+def draw_figure(canvas, figure):
+    tkcanvas = FigureCanvasTkAgg(figure, canvas)
+    tkcanvas.draw()
+    tkcanvas.get_tk_widget().pack(side='top', fill='both', expand=1)
+    return tkcanvas
+
+
+
 if __name__ == "__main__":
     l1 = 500
     l2 = 450
     plot = ScaraPlot(l1, l2)
 
     grbl = GrblInterface()
-    time.sleep(1)
 
-    # stream gcode file
-    selected_file = os.path.join(os.path.dirname(__file__), 'test2.gcode')
-    t_gcode = Thread(target=send_gcode, args=(grbl, selected_file))
-    t_gcode.start()
+    # define the window layout
+    terminal_layout = [
+        [sg.Multiline(size=(70, 40), key='-ML-', autoscroll=True)],
+        [sg.Input(key='-IN-', size=(60,1)), sg.Button('Send', bind_return_key=True)]
+    ]
+    view_layout = [
+        [sg.Text('', size=(80,1), key='-MPOS-')],
+        [sg.Text('', size=(80,1), key='-REPORT-')],
+        [sg.Canvas(key='-CANVAS-')]
+    ]
 
-    # wait till all commands are processed
-    while t_gcode.is_alive() or len(grbl.chars_in_buffer.queue) > 0:
-        report = grbl.get_report()
-        q = report['Qj'].split(',')
-        q = np.array([float(q[0]), float(q[1])])
-        q = q / 180 * np.pi
-        xy = report['MPos'].split(',')
-        xy = np.array([float(xy[0]), float(xy[1])])
+    layout = [[sg.Column(terminal_layout), sg.VSeperator(), sg.Column(view_layout)]]
 
-        plot.plot_update(q, xy)
-        time.sleep(STATE_POLL_INTERVAL)
+    window = sg.Window('Simple Scara GRBL interface', layout, size=(1400, 700), finalize=True, element_justification='center', font='Helvetica 11')
+    window.bind('<Up>', '_PREVIOUS_COMMAND_')
+    window.bind('<Down>', '_NEXT_COMMAND_')
+
+    # add the plot to the window
+    tkcanvas = draw_figure(window['-CANVAS-'].TKCanvas, plot.fig)
+
+    last_log_len = 0
+    send_history = ['?']
+    history_idx = 0
+    while True:
+        if grbl.new_report == True:
+            grbl.new_report = False
+            report = grbl.get_report()
+            plot.plot_report(report)
+            report_string_1 = f'State:{report.pop("State")}  MPos:{report.pop("MPos")}'
+            report_string_2 = [f'{key}:{value} | ' for key, value in report.items()]
+            window['-MPOS-'].update(report_string_1)
+            window['-REPORT-'].update(''.join(report_string_2))
+        if len(grbl.log) > last_log_len:
+            last_log_len = len(grbl.log)
+            window['-ML-'].update('\n'.join(grbl.log))
+
+        event, values = window.read(timeout=500)
+        print(event)
+        if event == sg.WIN_CLOSED:
+            break
+        elif event == 'Send':
+            msg = values['-IN-']
+            print(f">>>> {msg}")
+            grbl.serial_send(msg)
+            if send_history[-1] != msg:
+                send_history.append(msg)
+                history_idx = len(send_history)-1
+        elif event == '_PREVIOUS_COMMAND_':
+            history_idx = max(0, history_idx-1)
+            window['-IN-'].update(send_history[history_idx])
+        elif event == '_NEXT_COMMAND_':
+            history_idx = min(len(send_history)-1, history_idx+1)
+            window['-IN-'].update(send_history[history_idx])
+
 
     grbl.close()
-    print("done")
+    window.close()
